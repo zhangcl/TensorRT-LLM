@@ -50,6 +50,8 @@ option(BUILD_DEEP_EP "Build the Deep EP module" ON)
 option(BUILD_DEEP_GEMM "Build the DeepGEMM module" ON)
 option(BUILD_FLASH_MLA "Build the FlashMLA module" ON)
 option(BUILD_MICRO_BENCHMARKS "Build C++ micro benchmarks" OFF)
+option(ENABLE_SAGE_ATTENTION3
+       "Build experimental SageAttention3 Blackwell Torch ops" OFF)
 option(NVTX_DISABLE "Disable all NVTX features" ON)
 option(WARNING_IS_ERROR "Treat all warnings as errors" OFF)
 option(FAST_BUILD "Skip compiling some kernels to accelerate compiling" OFF)
@@ -79,6 +81,13 @@ if(NOT ${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
   message(
     STATUS
       "CUDA ${CUDAToolkit_VERSION} < 12.8: disabling ENABLE_CUBLASLT_FP4_GEMM")
+endif()
+if(ENABLE_SAGE_ATTENTION3
+   AND NOT ${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
+  message(
+    FATAL_ERROR
+      "ENABLE_SAGE_ATTENTION3 requires CUDA 12.8 or newer; found ${CUDAToolkit_VERSION}"
+  )
 endif()
 option(USING_OSS_CUTLASS_MOE_GEMM "Using open sourced Cutlass moe gemm kernel"
        ON)

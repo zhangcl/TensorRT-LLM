@@ -123,6 +123,44 @@ target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
 
+if(ENABLE_SAGE_ATTENTION3)
+  if(NOT ("100" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "120" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
+          OR "121" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG))
+    message(
+      FATAL_ERROR
+        "ENABLE_SAGE_ATTENTION3 requires CMAKE_CUDA_ARCHITECTURES to include 100, 120, or 121."
+    )
+  endif()
+
+  add_library(sage_attention3_thop OBJECT sageAttention3Op.cu
+                                              sageAttention3QuantOp.cu)
+  set_property(TARGET sage_attention3_thop PROPERTY POSITION_INDEPENDENT_CODE
+                                               ON)
+  set_property(TARGET sage_attention3_thop
+               PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  set_cuda_architectures(sage_attention3_thop 100 120 121)
+  target_include_directories(
+    sage_attention3_thop PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention3)
+  target_link_libraries(sage_attention3_thop PRIVATE ${TORCH_LIBRARIES}
+                                                     ${Python3_LIBRARIES})
+  target_compile_options(
+    sage_attention3_thop
+    PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+      $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>
+      $<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=--verbose,--warn-on-local-memory-usage>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DCUTLASS_DEBUG_TRACE_LEVEL=0>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DNDEBUG>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DQBLKSIZE=128>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DKBLKSIZE=128>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DCTA256>
+      $<$<COMPILE_LANGUAGE:CUDA>:-DDQINRMEM>)
+  target_sources(th_common PRIVATE $<TARGET_OBJECTS:sage_attention3_thop>)
+  target_compile_definitions(th_common PUBLIC ENABLE_SAGE_ATTENTION3)
+endif()
+
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common
                              PUBLIC "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")

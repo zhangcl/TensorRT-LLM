@@ -16,6 +16,7 @@ def get_attention_backend(
     backend_name: str,
     sparse_attn_config: Optional["SparseAttentionConfig"] = None
 ) -> Type[AttentionBackend]:
+    backend_name = backend_name.upper()
     if backend_name == "VANILLA":
         if sparse_attn_config is not None:
             return get_vanilla_sparse_attn_attention_backend(sparse_attn_config)
@@ -24,6 +25,11 @@ def get_attention_backend(
         if sparse_attn_config is not None:
             return get_trtllm_sparse_attn_attention_backend(sparse_attn_config)
         return TrtllmAttention
+    elif backend_name in ("SAGE3", "SAGE_ATTENTION3"):
+        if sparse_attn_config is not None:
+            raise ValueError("SageAttention3 backend does not support sparse attention")
+        from .sage_attention3_backend import SageAttention3Attention
+        return SageAttention3Attention
     elif backend_name == "FLASHINFER" and IS_FLASHINFER_AVAILABLE:
         from .flashinfer import FlashInferAttention
         if sparse_attn_config is not None:
