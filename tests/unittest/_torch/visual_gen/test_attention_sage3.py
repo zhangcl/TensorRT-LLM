@@ -197,6 +197,42 @@ def test_visual_gen_sage_attention3_cross_attention_matches_sdpa():
     not _sage3_ops_available(),
     reason="SageAttention3 ops require a build with -DENABLE_SAGE_ATTENTION3=ON.",
 )
+def test_visual_gen_sage_attention3_large_self_attention_smoke():
+    torch.manual_seed(1234)
+    dtype = torch.bfloat16
+    seq_len = 32768
+    num_heads = 12
+    head_dim = 128
+    attn = create_visual_gen_attention(
+        "SAGE3",
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_heads,
+        dtype=dtype,
+    )
+
+    q = torch.randn(1, seq_len, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    torch.cuda.synchronize()
+
+    out = attn.forward(q, k, v, attention_mask=PredefinedAttentionMask.FULL)
+    torch.cuda.synchronize()
+
+    assert out.shape == q.shape
+    assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")
+@pytest.mark.skipif(
+    _cuda_cc() not in ((10, 0), (12, 0), (12, 1)),
+    reason="SageAttention3 requires Blackwell.",
+)
+@pytest.mark.skipif(
+    not _sage3_ops_available(),
+    reason="SageAttention3 ops require a build with -DENABLE_SAGE_ATTENTION3=ON.",
+)
 def test_sage_attention3_backend_no_kv_cache():
     torch.manual_seed(1234)
     batch_size = 2

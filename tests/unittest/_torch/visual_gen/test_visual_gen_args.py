@@ -134,6 +134,16 @@ class TestVisualGenArgsFromDict:
         assert isinstance(args.cache, TeaCacheConfig)
         assert args.teacache.teacache_thresh == 0.3
 
+    def test_sage3_attention_backend_allowed(self):
+        args = VisualGenArgs(
+            **{
+                "checkpoint_path": "/tmp/model",
+                "attention": {"backend": "SAGE3"},
+            }
+        )
+        assert args.attention.backend == "SAGE3"
+        assert AttentionConfig(backend="SAGE_ATTENTION3").backend == "SAGE_ATTENTION3"
+
     def test_quant_config_dict_coerced(self):
         args = VisualGenArgs(
             **{
