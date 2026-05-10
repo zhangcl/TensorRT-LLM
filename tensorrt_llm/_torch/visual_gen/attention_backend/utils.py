@@ -37,7 +37,7 @@ def get_visual_gen_attention_backend(
     Get diffusion attention backend class by name.
 
     Args:
-        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend_name: Backend identifier ("VANILLA", "TRTLLM", "FA4", "SAGE3")
 
     Returns:
         Diffusion attention backend class
@@ -49,9 +49,12 @@ def get_visual_gen_attention_backend(
                     Better performance but requires fused QKV
         - "FA4": Flash Attention 4; provides higher speedup on Blackwell GPUs (sm100)
                          Requires flash-attn package with cute interface
+        - "SAGE3": SageAttention3 Blackwell NVFP4 backend for full/non-causal
+                   diffusion attention
     """
     # Lazy imports to avoid circular dependency
     from .flash_attn4 import FlashAttn4Attention
+    from .sage_attention3 import SageAttention3Attention
     from .trtllm import TrtllmAttention
     from .vanilla import VanillaAttention
 
@@ -63,9 +66,14 @@ def get_visual_gen_attention_backend(
         return TrtllmAttention
     elif backend_name == "FA4":
         return FlashAttn4Attention
+    elif backend_name in ("SAGE3", "SAGE_ATTENTION3"):
+        return SageAttention3Attention
     else:
-        # Default to VANILLA for maximum compatibility
-        return VanillaAttention
+        supported = "VANILLA, TRTLLM, FA4, SAGE3"
+        raise ValueError(
+            f"Unknown visual-gen attention backend '{backend_name}'. "
+            f"Supported backends: {supported}."
+        )
 
 
 def create_attention(
@@ -89,7 +97,7 @@ def create_attention(
     internally, simplifying the forward() call.
 
     Args:
-        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4")
+        backend: Backend identifier ("VANILLA", "TRTLLM", "FA4", "SAGE3")
         layer_idx: Layer index in the model
         num_heads: Number of attention heads
         head_dim: Dimension per head
@@ -108,9 +116,10 @@ def create_attention(
     Returns:
         AttentionBackend instance
     """
-    attn_cls = get_visual_gen_attention_backend(backend)
+    backend_name = backend.upper()
+    attn_cls = get_visual_gen_attention_backend(backend_name)
 
-    if backend.upper() == "TRTLLM":
+    if backend_name == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
                 "TRTLLM backend requires `attention_metadata_state` from "

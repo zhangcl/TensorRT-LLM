@@ -23,6 +23,7 @@ simplified metadata that doesn't require KV caching.
 from .flash_attn4 import FlashAttn4Attention
 from .interface import AttentionBackend, AttentionTensorLayout
 from .parallel import Attention2DAttention, UlyssesAttention
+from .sage_attention3 import SageAttention3Attention
 from .trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .utils import create_attention, get_visual_gen_attention_backend
 from .vanilla import VanillaAttention
@@ -34,6 +35,7 @@ __all__ = [
     "get_visual_gen_attention_backend",
     "create_attention",
     "FlashAttn4Attention",
+    "SageAttention3Attention",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
     "UlyssesAttention",
