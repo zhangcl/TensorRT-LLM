@@ -45,21 +45,25 @@ def test_sage_attention3_backend_registry():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("seq_len", [128, 256])
-@pytest.mark.parametrize("is_causal", [False, True])
-def test_sage_attention3_blackwell_matches_sdpa(dtype, head_dim, seq_len,
-                                                is_causal):
+def test_sage_attention3_blackwell_matches_sdpa(dtype, head_dim, seq_len):
     torch.manual_seed(1234)
     q = torch.randn(1, 4, seq_len, head_dim, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
 
-    out = sage_attention3_blackwell(q, k, v, is_causal=is_causal)
-    ref = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+    out = sage_attention3_blackwell(q, k, v, is_causal=False)
+    ref = F.scaled_dot_product_attention(q, k, v, is_causal=False)
 
     assert out.shape == ref.shape
     assert torch.isfinite(out).all()
     cos = F.cosine_similarity(out.flatten().float(), ref.flatten().float(), dim=0)
     assert cos > 0.95
+
+
+def test_sage_attention3_causal_mode_rejected():
+    q = torch.empty(1, 4, 128, 64)
+    with pytest.raises(NotImplementedError):
+        sage_attention3_blackwell(q, q, q, is_causal=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required.")

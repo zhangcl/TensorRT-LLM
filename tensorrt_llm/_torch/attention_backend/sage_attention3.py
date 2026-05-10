@@ -97,6 +97,12 @@ def sage_attention3_blackwell(
     dispatches to TensorRT-LLM's experimental SageAttention3 CUDA op.
     """
 
+    if is_causal:
+        raise NotImplementedError(
+            "SageAttention3 causal mode is disabled in this integration because "
+            "the upstream Blackwell kernel does not currently match SDPA numerics "
+            "on SM120. Use non-causal/full attention for the NVFP4 AIGV path.")
+
     _check_supported(q, k, v)
 
     q_len = q.size(-2)

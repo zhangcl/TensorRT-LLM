@@ -21,16 +21,18 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
-from ...custom_ops.cute_dsl_custom_ops import (
-    GroupedGemmInputsHelper,
-    Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-    Sm100BlockScaledContiguousGroupedGemmRunner,
-    Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
+from ...custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
+if IS_CUTLASS_DSL_AVAILABLE:
+    from ...custom_ops.cute_dsl_custom_ops import (
+        Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner)
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
@@ -136,6 +138,16 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
                                          updated_b[:, :, i])
     ref = ref.to(torch.bfloat16)
     return ref
+
+
+_CUTLASS_DSL_RUNNER_TYPES = ()
+if IS_CUTLASS_DSL_AVAILABLE:
+    _CUTLASS_DSL_RUNNER_TYPES = (
+        Sm100BlockScaledContiguousGroupedGemmRunner,
+        Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
+        Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
+        Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner,
+    )
 
 
 def cute_dsl_nvfp4_grouped_gemm_ref(
@@ -322,13 +334,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             return True
 
         for runner, tactic in comb:
-            if isinstance(
-                    runner,
-                (Sm100BlockScaledContiguousGroupedGemmRunner,
-                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionRunner,
-                 Sm100BlockScaledContiguousGroupedGemmSwigluFusionRunner,
-                 Sm100BlockScaledContiguousGatherGroupedGemmSwigluFusionRunner
-                 )):
+            if isinstance(runner, _CUTLASS_DSL_RUNNER_TYPES):
                 mma_tiler_mn, *_ = tactic
                 if mma_tiler_mn[0] != tile_size:
                     return False
@@ -376,6 +382,9 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
         """
         from .interface import _warn_and_return
+
+        if not IS_CUTLASS_DSL_AVAILABLE:
+            return _warn_and_return("CuteDSL is not available")
 
         sm_version = get_sm_version()
 

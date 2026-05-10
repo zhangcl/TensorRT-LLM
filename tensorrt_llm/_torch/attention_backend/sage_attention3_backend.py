@@ -47,9 +47,10 @@ class SageAttention3Attention(VanillaAttention):
             raise ValueError(
                 "SageAttention3 backend expects RoPE to be applied before attention"
             )
-        if attention_mask not in (PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL):
+        if attention_mask != PredefinedAttentionMask.FULL:
             raise ValueError(
-                f"SageAttention3 does not support attention mask {attention_mask}"
+                "SageAttention3 backend only supports full/non-causal "
+                f"attention, got {attention_mask}"
             )
         if metadata.seq_lens is None:
             raise ValueError(
@@ -102,7 +103,7 @@ class SageAttention3Attention(VanillaAttention):
             q,
             k,
             v,
-            is_causal=attention_mask == PredefinedAttentionMask.CAUSAL,
+            is_causal=False,
             softmax_scale=softmax_scale,
         )
         return out.transpose(1, 2).reshape(

@@ -8,6 +8,7 @@ if platform.system() != "Windows":
     try:
         import cutlass  # noqa
         import cutlass.cute as cute  # noqa
+        import cutlass.pipeline as pipeline  # noqa
         logger.info(f"cutlass dsl is available")
         IS_CUTLASS_DSL_AVAILABLE = True
     except ImportError:
