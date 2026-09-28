@@ -21,6 +21,14 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
     BufferKind, mxfp8_quantize_gemm_autotuned)
+from tensorrt_llm._torch.locality_domain.layout import (
+    make_bf16_linear_output_layout, make_nvfp4_linear_output_layout)
+from tensorrt_llm._torch.locality_domain.policy import (
+    DISABLED_PLAN, LinearPartitionPlan, LocalityDomainExecutionPlanner,
+    LocalityDomainPolicy)
+from tensorrt_llm._torch.locality_domain.runtime import LocalityDomainRuntime
+from tensorrt_llm._torch.locality_domain_utils import \
+    get_current_locality_domain
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -110,6 +118,47 @@ class TensorParallelMode(str, enum.Enum):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
 
 
+def _copy_to_new_cuda_allocation(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy ``tensor`` into a fresh contiguous allocation on the current CUDA device.
+
+    The allocation follows the allocator selected by the surrounding context,
+    including ``torch.cuda.use_mem_pool``. Unlike ``contiguous().cuda()``, this
+    always allocates new storage when ``tensor`` is already contiguous and on
+    the current CUDA device.
+    """
+    copied = torch.empty_like(
+        tensor,
+        device="cuda",
+        memory_format=torch.contiguous_format,
+    )
+    copied.copy_(tensor)
+    return copied
+
+
+def split_indice_for_locality_domain(tensor: torch.Tensor, indices=None):
+    current_locality_domain = get_current_locality_domain()
+    if current_locality_domain is None:
+        return indices
+    if indices is None:
+        indices = [slice(d) for d in tensor.shape]
+    elif isinstance(indices, slice):
+        # safetensor path passes a single slice — wrap in a per-dim list
+        indices = [indices] + [slice(d) for d in tensor.shape[1:]]
+    elif isinstance(indices, tuple):
+        indices = list(indices)
+    # indices is now a mutable list[slice]
+    n_start = indices[0].start if indices[0].start is not None else 0
+    n_end = indices[0].stop if indices[0].stop is not None else tensor.shape[0]
+    width = n_end - n_start
+    locality_domain_count = 2
+    slice_width = math.ceil(width / locality_domain_count)
+    n_slice_start = current_locality_domain * slice_width
+    n_slice_end = min((current_locality_domain + 1) * slice_width, width)
+    n_slice = slice(n_start + n_slice_start, n_start + n_slice_end)
+    indices[0] = n_slice
+    return indices
+
+
 def quant_config_has_nvfp4_activation_quantization(
         quant_config: Optional[QuantConfig]) -> bool:
     """Whether the quantization algorithm converts activations to NVFP4."""
@@ -169,6 +218,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
                                           indices: list[slice] | None = None):
+            indices = split_indice_for_locality_domain(tensor, indices)
             if indices is None:
                 # Avoid unnecessary copy
                 result = (tensor.to(device), [slice(d) for d in tensor.shape])
@@ -183,6 +233,7 @@ def load_weight_shard(
 
         def maybe_convert_to_torch_tensor(
             tensor, indices: Union[slice, tuple[slice]] = slice(None)):
+            indices = split_indice_for_locality_domain(tensor, indices)
             return tensor[indices].to(device)
     else:
         raise ValueError(f'unsupported weight type: {type(weight)}')
@@ -1564,12 +1615,14 @@ class NVFP4LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
+        device = 'cuda' if get_current_locality_domain() is not None else None
         module.scaling_vector_size = self.resolve_scaling_vector_size(module)
         assert in_features % module.scaling_vector_size == 0, f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
 
         # Quantized weights
         module.weight = Parameter(torch.empty([out_features, in_features // 2],
-                                              dtype=fp4_utils.float4_e2m1x2),
+                                              dtype=fp4_utils.float4_e2m1x2,
+                                              device=device),
                                   requires_grad=False)
 
         # FP8 per-block scaling factors. dtype must be aligned with SF_DTYPE
@@ -1608,7 +1661,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         module.pre_quant_scale = None
 
         if bias:
-            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+            module.bias = Parameter(torch.empty((out_features),
+                                                dtype=dtype,
+                                                device=device),
                                     requires_grad=False)
         else:
             module.register_parameter("bias", None)
@@ -3736,6 +3791,8 @@ class Linear(nn.Module):
         fused_weight_shard_indices_mapping: Optional[dict] = None,
         nvfp4_allowed_backends: Optional[List[str]] = None,
         enable_gemm_allreduce_fusion: bool = True,
+        locality_domain_policy: Optional[LocalityDomainPolicy] = None,
+        enable_locality_domain_bf16_linear: bool = False,
         override_tp_sharding: Optional[Union[tuple[int, int],
                                              Dict[str, tuple[int,
                                                              int]]]] = None,
@@ -3859,8 +3916,10 @@ class Linear(nn.Module):
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_bf16_gemm = use_cute_dsl_bf16_gemm
+        self.enable_locality_domain_bf16_linear = enable_locality_domain_bf16_linear
         self.lora = lora
 
+        self._enable_gemm_allreduce_fusion = enable_gemm_allreduce_fusion
         mpi_enabled = not mpi_disabled()
         dtype_supported = self.dtype in (torch.float16, torch.bfloat16)
         in_features_aligned = self.in_features % 128 == 0
@@ -3888,6 +3947,25 @@ class Linear(nn.Module):
                 torch.device('cuda:0'))
             # enable cuda core for sm89, sm120, and sm121
             self.enable_cuda_core = capability in ((8, 9), (12, 0), (12, 1))
+
+        # --- locality domain Policy/Layout/Runtime architecture ---
+        if locality_domain_policy is None:
+            model_attrs = get_model_extra_attrs()
+            if model_attrs:
+                locality_domain_policy = model_attrs.get(
+                    "locality_domain_policy")
+        self._locality_domain_policy = (locality_domain_policy
+                                        if locality_domain_policy is not None
+                                        else LocalityDomainPolicy())
+        # The final per-layer quantization config is applied after module
+        # construction. Plan at create_weights(), alongside quant_method and
+        # the final weight schema, so layerwise overrides cannot leave stale
+        # locality domain state behind.
+        self.partition_plan = DISABLED_PLAN
+        self._locality_domain_runtime = None
+        self._locality_domain_weight_shards = None
+        self._locality_domain_added_cutedsl_backend = False
+        self._locality_domain_planned_quant_config = None
 
         if not skip_create_weights_in_init:
             self.create_weights()
@@ -4069,7 +4147,90 @@ class Linear(nn.Module):
         slice_obj[split_dim] = slice(slice_start, slice_end)
         return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
+    def _refresh_fused_gemm_allreduce(self) -> None:
+        """Recompute the fused GEMM/all-reduce gate from final quantization."""
+        layer_quant_mode = getattr(self.quant_config, "layer_quant_mode", None)
+        quant_valid = (layer_quant_mode is not None
+                       and layer_quant_mode.has_nvfp4())
+        enabled = all([
+            self.reduce_output,
+            not mpi_disabled(),
+            self.dtype in (torch.float16, torch.bfloat16),
+            self.in_features % 128 == 0,
+            self.out_features % 64 == 0,
+            self.tp_mode == TensorParallelMode.ROW,
+            self.tp_size > 1,
+            quant_valid,
+            get_sm_version() >= 100,
+            self._enable_gemm_allreduce_fusion,
+            os.environ.get("TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1",
+        ])
+        self.use_fused_gemm_allreduce = enabled and ipc_nvls_supported()
+
+    def _replan_locality_domain(self) -> None:
+        """Plan locality domain execution from the final effective Linear config."""
+        if self._weights_created:
+            raise RuntimeError(
+                "Cannot replan locality domain Linear while its weight schema is live; "
+                "reset and recreate the module weights after changing "
+                "quantization.")
+        if self._locality_domain_weight_shards is not None:
+            raise RuntimeError(
+                "Cannot replan locality domain Linear after localized weight shards were "
+                "created; reload the module weights before changing its "
+                "quantization or locality domain policy.")
+
+        planner = LocalityDomainExecutionPlanner(self._locality_domain_policy)
+        plan = planner.plan_linear(
+            self.in_features,
+            self.out_features,
+            self.quant_config,
+            self.weights_loading_config.weight_mode,
+            dtype=self.dtype,
+            use_cute_dsl_bf16_gemm=self.use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=self.
+            enable_locality_domain_bf16_linear,
+        )
+        if (plan.enabled and self.weights_loading_config.weight_mode
+                == WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            expected_mapping = {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }
+            if self.fused_weight_shard_indices_mapping != expected_mapping:
+                plan = LinearPartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=
+                    ("locality domain fused gate/up Linear requires canonical "
+                     "[gate | up] shard mapping"),
+                )
+
+        if self._locality_domain_added_cutedsl_backend:
+            self.nvfp4_allowed_backends.remove("cutedsl")
+            self._locality_domain_added_cutedsl_backend = False
+        if (plan.enabled and plan.op_kind == "nvfp4_linear"
+                and "cutedsl" not in self.nvfp4_allowed_backends):
+            self.nvfp4_allowed_backends.append("cutedsl")
+            self._locality_domain_added_cutedsl_backend = True
+
+        self.partition_plan = plan
+        self._locality_domain_runtime = (LocalityDomainRuntime(
+            plan.num_partitions) if plan.enabled else None)
+        self._locality_domain_planned_quant_config = self.quant_config
+        self._refresh_fused_gemm_allreduce()
+
     def create_weights(self):
+        if self._weights_created:
+            if self.quant_config is not self._locality_domain_planned_quant_config:
+                raise RuntimeError(
+                    "Linear quant_config changed after weights were created; "
+                    "reset _weights_created and recreate the weight schema.")
+            return
+        self._replan_locality_domain()
+        self.create_weights_impl()
+
+    def create_weights_impl(self):
         if self._weights_created:
             return
 
@@ -4184,6 +4345,14 @@ class Linear(nn.Module):
                      bias,
                      lora_params: Optional[dict] | None = None,
                      layer_idx: Optional[int] | None = None):
+        if self._locality_domain_weight_shards is not None:
+            output = self._run_linear_locality_domain(input, bias)
+            if self.lora is not None and bool(lora_params):
+                lora_result = self.lora(input, lora_params, layer_idx)
+                if lora_result is not None:
+                    output = output + lora_result
+            return output
+
         if self.lora is not None and bool(lora_params):
             output = LoraLayer.forward_with_base(
                 lambda: self.quant_method.apply(self, input, bias),
@@ -4195,6 +4364,128 @@ class Linear(nn.Module):
         else:
             output = self.quant_method.apply(self, input, bias)
         return output
+
+    def _run_linear_locality_domain(self, input, bias):
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            return self._run_nvfp4_linear_locality_domain(input, bias)
+        if self.partition_plan.op_kind == "bf16_linear":
+            return self._run_bf16_linear_locality_domain(input, bias)
+        raise RuntimeError(
+            f"Unsupported locality domain Linear operation: {self.partition_plan.op_kind}"
+        )
+
+    def _run_nvfp4_linear_locality_domain(self, input, bias):
+        """Execute a partitioned linear across both locality domain partitions.
+
+        The composite CuTe DSL op tunes with both partitions active, then
+        launches the same tactic on both partition streams. Each kernel writes
+        directly into its slice of a shared, strided output buffer.
+
+        Args:
+            bias: Caller-controlled bias. None means skip bias (e.g. ROW
+                  parallel tp_rank > 0, or fused into allreduce).
+        """
+        shards = self._locality_domain_weight_shards
+        layout = self.partition_plan.layout
+        assert layout is not None, "locality domain Linear requires partition layout metadata"
+        num_p = layout.num_partitions
+        assert num_p == 2, "locality domain Linear requires exactly two partitions"
+        n = layout.logical_axis_extent
+
+        # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
+        original_shape = None
+        if isinstance(input, Fp4QuantizedTensor) and input.fp4_tensor.dim() > 2:
+            original_shape = input.fp4_tensor.shape
+            input = Fp4QuantizedTensor(
+                fp4_tensor=input.fp4_tensor.reshape(-1,
+                                                    input.fp4_tensor.shape[-1]),
+                scaling_factor=input.scaling_factor,
+                is_sf_swizzled=input.is_sf_swizzled,
+                unquantized_hidden_states=input.unquantized_hidden_states,
+            )
+        elif isinstance(input, tuple) and input[0].dim() > 2:
+            original_shape = input[0].shape
+            input = (
+                input[0].reshape(-1, input[0].shape[-1]),
+                input[1],
+            )
+        elif not isinstance(input,
+                            (tuple, Fp4QuantizedTensor)) and input.dim() > 2:
+            original_shape = input.shape
+            input = input.reshape(-1, input.shape[-1])
+
+        # Quantize input once (shared across partitions)
+        act_fp4, act_sf, alpha = self.quant_method._input_prepare(self, input)
+        m = act_fp4.shape[0]
+
+        # Each shard's N may be padded beyond out_features / num_partitions.
+        shard_n = layout.per_partition_axis_extent(padded=True)
+        assert shards[0]['weight'].size(0) == shard_n
+        full_n = layout.padded_axis_extent
+
+        # Output buffer: full_n to accommodate padding, truncated at the end
+        output = torch.empty(m, full_n, dtype=self.dtype, device=act_fp4.device)
+
+        torch.ops.trtllm.cute_dsl_nvfp4_gemm_locality_domain_inplace_rubin(
+            act_fp4,
+            shards[0]['weight'],
+            shards[1]['weight'],
+            act_sf,
+            shards[0]['weight_scale'],
+            shards[1]['weight_scale'],
+            alpha,
+            self.dtype,
+            False,
+            True,
+            output,
+        )
+
+        # Truncate padded columns if needed
+        if full_n > n:
+            output = output[:, :n].contiguous()
+
+        if bias is not None:
+            output.add_(bias)
+
+        if original_shape is not None:
+            output = output.reshape(*original_shape[:-1], output.shape[-1])
+
+        return output
+
+    def _run_bf16_linear_locality_domain(
+        self,
+        input: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        *,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        """Execute a BF16 Linear with output-N split across two locality domains."""
+        shards = self._locality_domain_weight_shards
+        layout = self.partition_plan.layout
+        assert shards is not None
+        assert layout is not None, "locality domain BF16 Linear requires layout metadata"
+        assert layout.num_partitions == 2
+        assert input.dtype == torch.bfloat16
+
+        original_shape = input.shape
+        input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+        output = torch.empty(
+            input_2d.shape[0],
+            layout.logical_axis_extent,
+            dtype=output_dtype,
+            device=input.device,
+        )
+        if input_2d.shape[0] > 0:
+            torch.ops.trtllm.cute_dsl_bf16_gemm_locality_domain_inplace_rubin(
+                input_2d,
+                shards[0]["weight"],
+                shards[1]["weight"],
+                output,
+                True,
+            )
+        if bias is not None:
+            output.add_(bias)
+        return output.reshape(*original_shape[:-1], output.shape[-1])
 
     def apply_linear_allreduce(self,
                                input,
@@ -4230,7 +4521,14 @@ class Linear(nn.Module):
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.tp_mode == TensorParallelMode.ROW:
-            use_fused_gemm_allreduce = self.use_fused_gemm_allreduce and lora_params is None
+            use_locality_domain = self.partition_plan.enabled
+            # The fused GEMM-allreduce and NCCL-window GEMM paths consume the
+            # module's full weight tensors. locality domain releases those tensors after
+            # creating localized shards, so ROW-TP must first run the
+            # shard-aware GEMM and then all-reduce its partial output.
+            use_fused_gemm_allreduce = (not use_locality_domain
+                                        and self.use_fused_gemm_allreduce
+                                        and lora_params is None)
             if use_fused_gemm_allreduce and all_reduce_params is not None:
                 use_fused_gemm_allreduce = all_reduce_params.enable_allreduce and all_reduce_params.fusion_op == AllReduceFusionOp.NONE
 
@@ -4249,7 +4547,8 @@ class Linear(nn.Module):
                     # (ClassVar); a failed window allocation falls back gracefully
                     # inside the C++ allocate_output.
                     use_nccl_symmetric_memory_window = (
-                        self.all_reduce is not None and self.quant_method.
+                        not use_locality_domain and self.all_reduce is not None
+                        and self.quant_method.
                         supports_nccl_symmetric_memory_window_output
                         and self.all_reduce.uses_nccl_symmetric_memory_window()
                         and not (self.lora is not None and lora_params))
@@ -4307,13 +4606,167 @@ class Linear(nn.Module):
         self._weights_transformed = True
 
     def post_load_weights(self) -> None:
+        if self._locality_domain_weight_shards is not None:
+            return
         self.transform_weights()
+        if self._locality_domain_runtime is not None:
+            shards = self._split_weights_for_locality_domain()
+            self._locality_domain_runtime.prepare_for_capture(
+                self.partition_plan)
+            self._locality_domain_weight_shards = shards
+            self._save_locality_domain_reload_metadata()
+            # Free full weights — shards on localized memory are the source of
+            # truth now. Keep bias because forward() uses it to preserve the
+            # module's logical bias contract and to support fused allreduce bias.
+            self.weight = Parameter(self.weight.new_empty(0),
+                                    requires_grad=False)
+            if self.partition_plan.op_kind == "nvfp4_linear":
+                self.weight_scale = Parameter(self.weight_scale.new_empty(0),
+                                              requires_grad=False)
+
+    def _save_locality_domain_reload_metadata(self) -> None:
+        """Keep only the original schemas needed to rebuild released weights."""
+        parameter_names = ["weight"]
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            parameter_names.append("weight_scale")
+
+        for parameter_name in parameter_names:
+            metadata = self.rebuild_tensor_metadata.get(parameter_name)
+            if metadata is None:
+                meta_tensor = getattr(self, parameter_name).to("meta")
+            else:
+                meta_tensor = metadata["meta"]
+            # Do not retain metadata["param"]: it aliases the transformed full
+            # weight and would defeat releasing it after localization.
+            self.rebuild_tensor_metadata[parameter_name] = {"meta": meta_tensor}
+
+    def _split_weights_for_locality_domain(self):
+        if self.partition_plan.op_kind == "nvfp4_linear":
+            return self._split_nvfp4_weights_for_locality_domain()
+        if self.partition_plan.op_kind == "bf16_linear":
+            return self._split_bf16_weights_for_locality_domain()
+        raise RuntimeError(
+            f"Unsupported locality domain Linear operation: {self.partition_plan.op_kind}"
+        )
+
+    def _split_nvfp4_weights_for_locality_domain(self):
+        """Split full-N weights into per-partition shards on localized memory.
+
+        Called after normal load + post_load so weight/weight_scale are final
+        (including padding and interleaving).
+
+        Weight (dim=0 is N, may be padded): split along dim=0.
+        Weight_scale: unswizzle to 2D → split unpadded rows → re-swizzle each
+            partition (swizzle_sf handles per-partition padding internally).
+        """
+        num_p = self.partition_plan.num_partitions
+        layout = make_nvfp4_linear_output_layout(
+            self.out_features,
+            self.in_features,
+            num_p,
+            padded_out_features=self.weight.size(0),
+        )
+
+        # Validate padding split invariant: splitting the full weight evenly
+        # must not introduce per-partition padding gaps in the output layout.
+        layout_reason = layout.disabled_reason_for_padding_free_split()
+        assert layout_reason is None, layout_reason
+        assert self.partition_plan.layout == layout, (
+            f"Runtime layout {layout} does not match planner layout "
+            f"{self.partition_plan.layout}")
+        if (self.weights_loading_config.weight_mode ==
+                WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            assert self.fused_weight_shard_indices_mapping == {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }, ("locality domain fused gate/up Linear requires canonical [gate | up] "
+                "row layout")
+
+        # Unswizzle weight_scale to 2D, split unpadded N rows, re-swizzle.
+        # We split on unpadded rows because the swizzle pattern is not simply
+        # splittable; re-swizzle handles per-partition padding internally.
+        sv = self.scaling_vector_size
+        scale_rows = fp4_utils.pad_up(self.out_features, 128)
+        ws_unswizzled = unswizzle_sf(
+            self.weight_scale.data,
+            scale_rows,
+            self.in_features,
+            sv,
+        )
+
+        shards = []
+        for pid in range(num_p):
+            padded_slice = layout.partition_axis_slice(pid, padded=True)
+            logical_slice = layout.partition_axis_slice(pid, padded=False)
+            with self._locality_domain_runtime.partition_weight_context(pid):
+                ws_part = ws_unswizzled[logical_slice].contiguous()
+                # The interleave op creates its output while the partition's
+                # localized memory pool is active.
+                ws_part_swizzled = torch.ops.trtllm.block_scale_interleave(
+                    ws_part.unsqueeze(0))
+                shard = {
+                    'weight':
+                    _copy_to_new_cuda_allocation(self.weight[padded_slice]),
+                    'weight_scale':
+                    ws_part_swizzled,
+                }
+                shards.append(shard)
+        return shards
+
+    def _split_bf16_weights_for_locality_domain(self):
+        """Split BF16 output rows into fresh allocations in localized pools."""
+        assert self._locality_domain_runtime is not None
+        assert self.weight.dtype == torch.bfloat16
+        layout = make_bf16_linear_output_layout(
+            self.out_features,
+            self.in_features,
+            self.partition_plan.num_partitions,
+        )
+        layout_reason = layout.disabled_reason_for_padding_free_split()
+        assert layout_reason is None, layout_reason
+        assert self.partition_plan.layout == layout, (
+            f"Runtime layout {layout} does not match planner layout "
+            f"{self.partition_plan.layout}")
+        assert tuple(self.weight.shape) == layout.logical_shape
+        if (self.weights_loading_config.weight_mode ==
+                WeightMode.FUSED_GATE_UP_LINEAR):
+            half_n = self.out_features // 2
+            assert self.fused_weight_shard_indices_mapping == {
+                "gate": (0, half_n),
+                "up": (half_n, half_n),
+            }, ("locality domain BF16 fused gate/up Linear requires canonical "
+                "[gate | up] row layout")
+
+        shards = []
+        for partition_id in range(layout.num_partitions):
+            weight_slice = layout.partition_axis_slice(partition_id,
+                                                       padded=False)
+            with self._locality_domain_runtime.partition_weight_context(
+                    partition_id):
+                shards.append({
+                    "weight":
+                    _copy_to_new_cuda_allocation(self.weight[weight_slice])
+                })
+        return shards
 
     def pre_reload_weights(self):
         assert hasattr(
             self.quant_method, "pre_reload_weights"
         ), "pre_reload_weights is not supported for this quant method"
+        had_locality_domain_shards = self._locality_domain_weight_shards is not None
+        if had_locality_domain_shards:
+            # Drop localized sources before allocating the full reload schema.
+            # post_load_weights() will rebuild the localized shards after the
+            # new weights have been loaded and transformed.
+            self._locality_domain_weight_shards = None
         self.quant_method.pre_reload_weights(self)
+        if had_locality_domain_shards:
+            # transform_weights() must treat the new full parameters as the
+            # first generation. In particular, padding transforms populate
+            # fresh reusable metadata instead of referencing released tensors.
+            self.rebuild_tensor_metadata = {}
+            self._weights_transformed = False
 
 
 def is_static_nvfp4_input_eligible(linear) -> bool:
