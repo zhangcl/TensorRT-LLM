@@ -38,6 +38,7 @@ class GatedMLP(nn.Module):
         use_custom_cublas_mm: bool = False,
         is_shared_expert: bool = False,
         swiglu_limit: Optional[float] = None,
+        enable_locality_domain_bf16_linear: bool = False,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
     ):
@@ -131,6 +132,9 @@ class GatedMLP(nn.Module):
                 and activation == F.silu and not bias
                 and (swiglu_limit is None or swiglu_limit == float("inf"))),
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=config.locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
             use_custom_cublas_mm=use_custom_cublas_mm,
@@ -163,6 +167,9 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+            enable_locality_domain_bf16_linear=(
+                use_cute_dsl_bf16_gemm and enable_locality_domain_bf16_linear),
+            locality_domain_policy=config.locality_domain_policy,
             disable_deep_gemm=disable_deep_gemm,
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
