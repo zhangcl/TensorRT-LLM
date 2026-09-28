@@ -10631,14 +10631,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
             m, k = a_tensor.shape
             n = b_tensor.shape[0]
             batch_size = 1
-            if split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
+
+            # Under a locality domain the caller passes the parent-wide [M, 2N]
+            # output; each partition writes only its own half in place, so the
+            # slice must keep the shared buffer's stride.
+            locality_domain_id = get_current_locality_domain()
+            locality_domain_half_gemm = locality_domain_id is not None
+            if locality_domain_half_gemm:
+                assert locality_domain_id in (
+                    0, 1), f"Invalid locality domain id: {locality_domain_id}"
+                assert tuple(c_tensor.shape) == (m, n * 2), (
+                    "[locality domain] BF16 GEMM output must be 2x width: "
+                    f"output.shape={tuple(c_tensor.shape)}, expected={(m, n * 2)}"
+                )
+                c_tensor = c_tensor[:, locality_domain_id * n:
+                                    (locality_domain_id + 1) * n]
+            elif split_k_slices > 1 and tuple(c_tensor.shape) != (m, n):
                 raise RuntimeError(
                     "BF16 split-K GEMM requires an [M, N] output, got "
                     f"output.shape={tuple(c_tensor.shape)}, expected={(m, n)}.")
 
             a_tensor = a_tensor.contiguous()
             b_tensor = b_tensor.contiguous()
-            c_needs_copy = not c_tensor.is_contiguous()
+            c_needs_copy = ((not locality_domain_half_gemm)
+                            and not c_tensor.is_contiguous())
             c_buf = torch.empty_like(c_tensor) if c_needs_copy else c_tensor
 
             a_batched = a_tensor.unsqueeze(0)  # [1, M, K]
